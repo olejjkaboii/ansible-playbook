@@ -1,0 +1,172 @@
+---
+# Первичная настройка домашнего сервера после переустановки ОС.
+#
+# Предполагается, что "бутстрап" уже сделан руками (это одна вещь, которую Ansible
+# не может сделать сам за тебя, потому что ему самому нужен рабочий SSH-доступ):
+#   1. Ubuntu Server установлена (на SSD в этот раз)
+#   2. Сеть настроена
+#   3. Твой публичный SSH-ключ уже лежит в ~/.ssh/authorized_keys (через физдоступ)
+#   4. Ты можешь зайти по ключу: ssh leque@<ip>
+#
+# Дальше уже всё остальное берёт на себя этот playbook.
+#
+# Перед первым запуском:
+#   ansible-galaxy collection install community.general community.docker
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini playbook.yml
+
+- name: Первичная настройка домашней security-лаборатории
+  hosts: homeserver
+  become: true
+
+  vars:
+    ssh_user: leque
+
+  tasks:
+    - name: Обновить кэш apt и все пакеты (dist-upgrade)
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+
+    - name: Установить базовые пакеты
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - fail2ban
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+
+    # --- SSH hardening ---
+
+    - name: Отключить парольную аутентификацию (основной sshd_config)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: restart ssh
+
+    - name: Запретить логин под root по SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify: restart ssh
+
+    - name: Найти drop-in конфиги sshd (та самая засада с cloud-init)
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d/
+        patterns: "*.conf"
+      register: sshd_dropins
+
+    - name: Не дать ни одному drop-in переопределить PasswordAuthentication обратно на yes
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '^PasswordAuthentication\s+yes'
+        replace: 'PasswordAuthentication no'
+      loop: "{{ sshd_dropins.files }}"
+      notify: restart ssh
+
+    # --- Firewall ---
+
+    - name: ufw — политика по умолчанию deny incoming
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: ufw — разрешить SSH
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: ufw — разрешить порт Juice Shop
+      community.general.ufw:
+        rule: allow
+        port: "3000"
+        proto: tcp
+
+    - name: ufw — разрешить порт DVWA
+      community.general.ufw:
+        rule: allow
+        port: "8080"
+        proto: tcp
+
+    - name: ufw — включить
+      community.general.ufw:
+        state: enabled
+
+    # --- fail2ban ---
+
+    - name: fail2ban — запущен и в автозагрузке
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: started
+        enabled: true
+
+    # --- Docker ---
+
+    - name: Добавить GPG-ключ Docker
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Добавить репозиторий Docker
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Установить Docker Engine + compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    # Сознательно НЕ добавляем ssh_user в группу docker: членство в ней —
+    # фактически root без пароля (docker run -v /:/host chroot /host).
+    # Раз это хост с намеренно уязвимыми сервисами (DVWA, Juice Shop),
+    # такой "бесплатный" путь к root не нужен — контейнерами управляем
+    # через sudo docker ... либо через сам ansible (community.docker
+    # ниже работает через become, ему группа не нужна).
+
+    # --- Лаборатория: Juice Shop + DVWA ---
+
+    - name: Создать директорию под лабораторию
+      ansible.builtin.file:
+        path: "/home/{{ ssh_user }}/lab"
+        state: directory
+        owner: "{{ ssh_user }}"
+        mode: "0755"
+
+    - name: Положить docker-compose.yml для Juice Shop + DVWA
+      ansible.builtin.copy:
+        dest: "/home/{{ ssh_user }}/lab/docker-compose.yml"
+        owner: "{{ ssh_user }}"
+        content: |
+          services:
+            juice-shop:
+              image: bkimminich/juice-shop
+              restart: unless-stopped
+              ports:
+                - "3000:3000"
+            dvwa:
+              image: vulnerables/web-dvwa
+              restart: unless-stopped
+              ports:
+                - "8080:80"
+
+    - name: Поднять лабораторию (docker compose up -d)
+      community.docker.docker_compose_v2:
+        project_src: "/home/{{ ssh_user }}/lab"
+        state: present
+
+  handlers:
+    - name: restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
